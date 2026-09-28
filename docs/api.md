@@ -17,9 +17,28 @@
 - `POST /patients/{patient_id}/consents` 创建更高版本的授权；`POST /consents/{consent_id}/withdraw` 撤回授权。
 - `POST /patients/{patient_id}/plans` 建立计划，医美和体重管理计划必须引用当前对应授权。
 - `POST /plans/{plan_id}/{propose|activate|pause|resume|complete|cancel}` 以 `expected_version` 执行带版本保护的状态转换。
+- `POST /plans/{plan_id}/revise` 在计划生效前修订目标、风险、目标日期或关联评估；内容变化会立即使该计划待审批或已批准的例外失效。
 - `GET /patients/{patient_id}/weight-series` 返回按观察时间排序的测量值，不生成诊断或治疗建议。
 
 评估签署后不可覆盖。就诊病历由章节组成，签署需要主诉、评估和计划三部分；签署后的补充内容成为新版本，原始文字仍保留。
+
+## 特殊计划例外审批
+
+超出门诊常规疗程节奏的计划不能由改计划的医生自行生效，必须经过另一位医生对固定计划版本的书面审批：
+
+- `POST /plans/{plan_id}/exceptions`（须提供 `Idempotency-Key`）提交申请，内容包含 `deviation.rule`（偏离的规则）与 `deviation.detail`、`clinical_reason`（临床理由）、`assessment_id`（关联的已签署评估）和 `valid_until`（例外有效期，不得晚于关联授权到期时间）。同一申请重复提交返回原结果；同一幂等键用于不同内容返回冲突。
+- `POST /plan-exceptions/{exception_id}/approve` 或 `/return` 由**另一位**具备资质的医生（clinician/owner，且不得是申请人）对送审时的固定计划版本作出同意或退回决定，均须填写 `note` 和 `expected_version`。
+- 申请被退回后，可用新的 `Idempotency-Key` 重新提交，形成同一申请下递增的修订版本；审批人仍不得是申请人。
+- 批准的前置条件：不存在未复核的停止级安全关注项（已确认的关注项表示医生已知情）、关联授权仍有效、关联评估仍已签署、例外仍在有效期内。授权撤回会立即使引用该授权的待审批/已批准例外失效。
+- 批准只绑定送审时的计划内容摘要。`revise` 修改计划内容后，待审批/已批准例外立即变为 `invalidated`，必须基于新版本重新送审；状态转换（提议等）不改变内容，不使审批失效。
+- 计划生效（`proposed→active`）时：存在待审批申请不能生效；存在已批准例外必须在激活请求中携带该 `exception_id`，服务在同一事务内重新核验内容未漂移、有效期未过、前置条件仍满足，然后把例外登记为计划的生效依据（计划记录 `approved_exception_id`）。已失效或已过期的审批既不能凭以激活，也不能绕过它裸激活。
+- `POST /plan-exceptions/{exception_id}/withdraw` 允许申请人或负责人在例外随计划生效前放弃例外；放弃后计划可按常规安排生效。
+- `POST /plan-exceptions/expire-due` 把已过有效期但尚未用于计划生效的批准批量标记为过期；迟到的激活请求即便撞上过期审批也会被拒绝，并把审批落为过期。
+- `GET /plan-exceptions/{exception_id}` 查看申请当前状态；`GET /plan-exceptions/{exception_id}/chain` 返回申请、每次送审修订、审批/退回/失效/过期/生效事件，以及计划自身的版本快照，构成申请→修订→审批→最终生效的完整版本链。
+- `GET /patients/{patient_id}/plan-exceptions` 列出患者的例外申请（需临床读权限）。
+- `GET /plans/exception-schedule` 是运营排程视图：以 `arrangement` 为 `routine` 或 `approved_exception` 区分常规安排与凭批准例外生效的计划，只返回排程字段，不返回临床理由、偏离说明或评估内容。
+
+例外状态：待审批 →（退回 → 修订后重新送审）｜（批准 → 已随计划生效）；批准后计划内容变化、授权撤回或计划取消使审批失效；有效期届满未生效则过期。所有申请、修订、审批、失效与生效动作均进入不可变审计链。
 
 ## 预约、随访与计划节点
 
@@ -45,7 +64,7 @@
 
 ## 主要状态
 
-- 计划：草稿 → 提议 → 生效；可暂停和恢复，完成或取消后不能重新激活。
+- 计划：草稿 → 提议 → 生效；可暂停和恢复，完成或取消后不能重新激活。凭特殊计划例外生效的计划带有 `approved_exception_id`，运营排程视图标记为 `approved_exception`。
 - 预约：占位 → 确认 → 到诊 → 服务中 → 完成；取消和未到诊是独立终态。
 - 不良事件：已报告 → 分诊 → 观察 → 已解决 → 关闭。每次处置单独记录操作人和理由。
 - 耗材预留：预留 → 释放或核销。库存数量由收货、预留、释放和更正流水求和，不直接改写历史数量。

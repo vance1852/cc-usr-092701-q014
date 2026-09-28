@@ -180,6 +180,20 @@ class ReportService:
             authorize(principal_for(connection, actor_id, clinic_id), "clinical:read", clinic_id=clinic_id)
             if connection.execute("SELECT 1 FROM patients WHERE id=? AND clinic_id=?", (patient_id, clinic_id)).fetchone() is None:
                 raise NotFound("患者不存在")
-            rows = connection.execute("SELECT id,kind,state,start_date,target_date,updated_at,version FROM plans "
-                                      "WHERE patient_id=? AND clinic_id=? ORDER BY start_date,id", (patient_id, clinic_id)).fetchall()
-            return {"patient_id": patient_id, "plans": [dict(row) for row in rows]}
+            rows = connection.execute(
+                "SELECT p.id,p.kind,p.state,p.start_date,p.target_date,p.updated_at,p.version,"
+                "p.approved_exception_id,e.state AS exception_state,e.valid_until AS exception_valid_until "
+                "FROM plans p LEFT JOIN plan_exceptions e ON e.id=p.approved_exception_id "
+                "WHERE p.patient_id=? AND p.clinic_id=? ORDER BY p.start_date,p.id",
+                (patient_id, clinic_id)).fetchall()
+            items = []
+            for row in rows:
+                item = {"id": row["id"], "kind": row["kind"], "state": row["state"],
+                        "start_date": row["start_date"], "target_date": row["target_date"],
+                        "updated_at": row["updated_at"], "version": row["version"],
+                        "approved_exception_id": row["approved_exception_id"]}
+                if row["approved_exception_id"]:
+                    item["exception_state"] = row["exception_state"]
+                    item["exception_valid_until"] = row["exception_valid_until"]
+                items.append(item)
+            return {"patient_id": patient_id, "plans": items}

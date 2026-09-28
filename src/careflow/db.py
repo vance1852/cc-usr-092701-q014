@@ -11,7 +11,7 @@ from typing import Iterator
 
 from .errors import StorageFailure
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 PRAGMA foreign_keys = ON;
@@ -114,11 +114,64 @@ CREATE TABLE IF NOT EXISTS plans (
     risk_json TEXT NOT NULL,
     start_date TEXT NOT NULL,
     target_date TEXT,
+    approved_exception_id TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     version INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS plans_patient_state ON plans(patient_id,state,updated_at DESC);
+CREATE TABLE IF NOT EXISTS plan_exceptions (
+    id TEXT PRIMARY KEY,
+    clinic_id TEXT NOT NULL REFERENCES clinics(id),
+    plan_id TEXT NOT NULL REFERENCES plans(id),
+    patient_id TEXT NOT NULL REFERENCES patients(id),
+    state TEXT NOT NULL CHECK(state IN ('pending','returned','approved','invalidated','expired','activated','withdrawn')),
+    requested_by TEXT NOT NULL REFERENCES staff(id),
+    decided_by TEXT REFERENCES staff(id),
+    current_revision INTEGER NOT NULL,
+    plan_version INTEGER NOT NULL,
+    plan_digest TEXT NOT NULL,
+    approved_revision INTEGER,
+    approved_plan_version INTEGER,
+    approved_plan_digest TEXT,
+    approved_at TEXT,
+    valid_until TEXT,
+    activated_at TEXT,
+    activated_activation_version INTEGER,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    version INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS plan_exceptions_plan ON plan_exceptions(plan_id,current_revision);
+CREATE INDEX IF NOT EXISTS plan_exceptions_patient ON plan_exceptions(patient_id,state,created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS plan_exceptions_pending ON plan_exceptions(plan_id)
+    WHERE state IN ('pending','approved');
+CREATE TABLE IF NOT EXISTS plan_exception_revisions (
+    exception_id TEXT NOT NULL REFERENCES plan_exceptions(id),
+    revision INTEGER NOT NULL,
+    plan_version INTEGER NOT NULL,
+    plan_digest TEXT NOT NULL,
+    deviation_json TEXT NOT NULL,
+    clinical_reason TEXT NOT NULL,
+    assessment_id TEXT,
+    valid_until TEXT NOT NULL,
+    submitted_by TEXT NOT NULL REFERENCES staff(id),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(exception_id,revision)
+);
+CREATE TABLE IF NOT EXISTS plan_exception_events (
+    id TEXT PRIMARY KEY,
+    exception_id TEXT NOT NULL REFERENCES plan_exceptions(id),
+    sequence INTEGER NOT NULL,
+    event_type TEXT NOT NULL CHECK(event_type IN ('submitted','returned','resubmitted','approved','invalidated','expired','activated','withdrawn')),
+    actor_id TEXT REFERENCES staff(id),
+    revision INTEGER NOT NULL,
+    plan_version INTEGER NOT NULL,
+    note TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(exception_id,sequence)
+);
+CREATE INDEX IF NOT EXISTS plan_exception_events_sequence ON plan_exception_events(exception_id,sequence);
 CREATE TABLE IF NOT EXISTS plan_milestones (
     id TEXT PRIMARY KEY,
     plan_id TEXT NOT NULL REFERENCES plans(id),
@@ -399,6 +452,7 @@ class Database:
         try:
             with self.session() as connection:
                 connection.executescript(SCHEMA)
+                self._migrate(connection)
                 connection.execute(
                     "INSERT INTO schema_meta(key,value) VALUES('schema_version',?) "
                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -406,6 +460,11 @@ class Database:
                 )
         except sqlite3.Error as exc:
             raise StorageFailure("数据库初始化失败", details={"reason": type(exc).__name__}) from exc
+
+    def _migrate(self, connection: sqlite3.Connection) -> None:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(plans)").fetchall()}
+        if "approved_exception_id" not in columns:
+            connection.execute("ALTER TABLE plans ADD COLUMN approved_exception_id TEXT")
 
     @contextmanager
     def transaction(self, *, write: bool = True) -> Iterator[sqlite3.Connection]:

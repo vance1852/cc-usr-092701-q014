@@ -290,5 +290,274 @@ class CareflowCase(unittest.TestCase):
             thread.join(timeout=3)
 
 
+class PlanExceptionCase(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.db = Database(Path(self.temp.name) / "clinic.sqlite3")
+        self.clock = FrozenClock(datetime(2026, 9, 27, 12, 0, tzinfo=UTC))
+        self.app = Careflow(self.db, self.clock)
+        initial = self.app.initialize_clinic("澄序门诊", "Asia/Shanghai", "诊所负责人", "LongPassphrase!2026")
+        self.clinic = initial["clinic_id"]
+        self.owner = initial["owner_id"]
+        self.doctor_a = self.app.create_staff(self.clinic, "医生甲", "clinician", actor_id=self.owner)["id"]
+        self.doctor_b = self.app.create_staff(self.clinic, "医生乙", "clinician", actor_id=self.owner)["id"]
+        self.nurse = self.app.create_staff(self.clinic, "护理人员", "nurse", actor_id=self.owner)["id"]
+        self.coordinator = self.app.create_staff(self.clinic, "运营协调员", "coordinator", actor_id=self.owner)["id"]
+        self.patient = self.app.create_patient(self.clinic, self.owner, "case-101", "沈女士")
+        consent_digest = hashlib.sha256(b"weight-r1").hexdigest()
+        self.consent = self.app.grant_consent(self.clinic, self.doctor_a, self.patient["id"],
+                                              "weight_program", 1, consent_digest)
+        self.assessment = self._assessment()
+        self.plan = self._plan()
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def _assessment(self, tag: str = "baseline") -> str:
+        assessment = self.app.create_assessment(self.clinic, self.doctor_a, self.patient["id"], "weight",
+                                                {"weight_kg": "80"}, {"note": tag})
+        self.app.sign_assessment(self.clinic, self.doctor_a, assessment["id"], expected_version=1)
+        return assessment["id"]
+
+    def _plan(self, description: str = "标准节奏计划"):
+        return self.app.create_plan(
+            self.clinic, self.doctor_a, self.patient["id"], "weight", self.doctor_a,
+            {"description": description, "review_interval_days": 30}, {}, "2026-09-27",
+            target_date="2026-12-27", assessment_id=self.assessment, consent_id=self.consent["id"])
+
+    def _submit(self, plan, key: str, *, valid_until: str = "2026-11-27T12:00:00Z",
+                rule=("review_interval_days", "30 天复核延长至 45 天"),
+                reason: str = "患者长期出差，无法按门诊常规节奏复诊",
+                assessment_id: str | None = None, revision_note: str | None = None):
+        return self.app.plan_exceptions.submit(
+            self.clinic, self.doctor_a, plan["id"],
+            deviation={"rule": rule[0], "detail": rule[1]}, clinical_reason=reason,
+            assessment_id=assessment_id or self.assessment, valid_until=valid_until,
+            idempotency_key=key, revision_note=revision_note)
+
+    def test_exception_requires_another_clinician_and_gates_activation(self):
+        with self.assertRaises(Forbidden):
+            self._submit_using(self.nurse, self.plan, "exc-nurse")
+        exception = self._submit(self.plan, "exc-1")
+        self.assertEqual(exception["state"], "pending")
+        self.assertEqual(exception["plan_version"], 1)
+        # 审批人不得是申请人。
+        with self.assertRaises(Forbidden):
+            self.app.plan_exceptions.decide(self.clinic, self.doctor_a, exception["id"], 1, "approve", note="自己同意")
+        # propose 只改状态不改内容，不应使固定版本的审批失效。
+        self.app.transition_plan(self.clinic, self.doctor_a, self.plan["id"], 1, "propose")
+        # 未提供批准例外时计划不能生效。
+        with self.assertRaises(Conflict):
+            self.app.transition_plan(self.clinic, self.doctor_a, self.plan["id"], 2, "activate")
+        decided = self.app.plan_exceptions.decide(self.clinic, self.doctor_b, exception["id"], 1,
+                                                  "approve", note="理由充分，同意例外")
+        self.assertEqual(decided["state"], "approved")
+        self.assertEqual(decided["approved_plan_version"], 2)
+        active = self.app.transition_plan(self.clinic, self.doctor_a, self.plan["id"], 2, "activate",
+                                          exception_id=exception["id"])
+        self.assertEqual(active["state"], "active")
+        self.assertEqual(active["approved_exception_id"], exception["id"])
+        self.assertEqual(self.app.plan_exceptions.get(self.clinic, self.doctor_b, exception["id"])["state"],
+                         "activated")
+        self.assertTrue(self.app.verify_audit(self.clinic, self.owner)["ok"])
+
+    def _submit_using(self, actor_id, plan, key):
+        return self.app.plan_exceptions.submit(
+            self.clinic, actor_id, plan["id"],
+            deviation={"rule": "review_interval_days", "detail": "延长"}, clinical_reason="理由",
+            assessment_id=self.assessment, valid_until="2026-11-27T12:00:00Z", idempotency_key=key)
+
+    def test_submit_is_idempotent_and_rejects_same_key_with_other_body(self):
+        first = self._submit(self.plan, "exc-2")
+        replay = self._submit(self.plan, "exc-2")
+        self.assertTrue(replay["replayed"])
+        self.assertEqual(replay["id"], first["id"])
+        with self.assertRaises(Conflict):
+            self._submit(self.plan, "exc-2", rule=("other_rule", "不同内容"), reason="另一条申请")
+
+    def test_unreviewed_stop_flag_blocks_approval_until_confirmed(self):
+        exception = self._submit(self.plan, "exc-3")
+        flag = self.app.clinical_flags.report(self.clinic, self.doctor_b, self.patient["id"],
+                                              "prior_reaction", "stop", "既往材料反应待核实")
+        with self.assertRaises(Conflict) as caught:
+            self.app.plan_exceptions.decide(self.clinic, self.doctor_b, exception["id"], 1,
+                                            "approve", note="同意")
+        self.assertIn("unreviewed_stop_flag", caught.exception.details["blockers"])
+        # 退回不受停止级关注项限制。
+        self.app.plan_exceptions.decide(self.clinic, self.doctor_b, exception["id"], 1,
+                                        "return", note="先完成安全复核")
+        resent = self._submit(self.plan, "exc-3b")
+        self.app.clinical_flags.review(self.clinic, self.doctor_b, flag["id"], 1, "confirm", "已核实原始材料")
+        self.assertEqual(self.app.plan_exceptions.decide(self.clinic, self.doctor_b, resent["id"],
+                                                        resent["version"], "approve", note="复核完成，同意")["state"],
+                         "approved")
+
+    def test_plan_change_after_approval_invalidates_and_requires_resubmission(self):
+        self.app.transition_plan(self.clinic, self.doctor_a, self.plan["id"], 1, "propose")
+        exception = self._submit(self.plan, "exc-4")
+        self.app.plan_exceptions.decide(self.clinic, self.doctor_b, exception["id"], 1, "approve", note="同意")
+        revised = self.app.revise_plan(
+            self.clinic, self.doctor_a, self.plan["id"], 2, reason="延长复核间隔",
+            goal={"description": "标准节奏计划", "review_interval_days": 45})
+        self.assertEqual(revised["version"], 3)
+        self.assertEqual(self.app.plan_exceptions.get(self.clinic, self.doctor_b, exception["id"])["state"],
+                         "invalidated")
+        # 旧批准无法激活；裸激活同样被阻断，不能借修订绕过审批。
+        with self.assertRaises(Conflict):
+            self.app.transition_plan(self.clinic, self.doctor_a, self.plan["id"], 3, "activate",
+                                     exception_id=exception["id"])
+        with self.assertRaises(Conflict):
+            self.app.transition_plan(self.clinic, self.doctor_a, self.plan["id"], 3, "activate")
+        renewed = self._submit(self.plan, "exc-4b", rule=("review_interval_days", "45 天再延长至 60 天"),
+                               reason="补充行程材料", revision_note="按新版本重新送审")
+        self.assertEqual(renewed["revision"], 2)
+        self.app.plan_exceptions.decide(self.clinic, self.doctor_b, renewed["id"], renewed["version"],
+                                        "approve", note="同意修订后版本")
+        active = self.app.transition_plan(self.clinic, self.doctor_a, self.plan["id"], 3, "activate",
+                                          exception_id=renewed["id"])
+        self.assertEqual(active["approved_exception_id"], renewed["id"])
+
+    def test_expired_approval_cannot_be_used_by_late_activation(self):
+        self.app.transition_plan(self.clinic, self.doctor_a, self.plan["id"], 1, "propose")
+        exception = self._submit(self.plan, "exc-5", valid_until="2026-09-28T12:00:00Z")
+        self.app.plan_exceptions.decide(self.clinic, self.doctor_b, exception["id"], 1, "approve", note="短期同意")
+        self.clock.set(datetime(2026, 9, 29, 0, 0, tzinfo=UTC))
+        with self.assertRaises(Conflict):
+            self.app.transition_plan(self.clinic, self.doctor_a, self.plan["id"], 2, "activate",
+                                     exception_id=exception["id"])
+        # 迟到激活已把审批落为过期；巡检不会重复处理。
+        self.assertEqual(self.app.plan_exceptions.get(self.clinic, self.doctor_b, exception["id"])["state"],
+                         "expired")
+        self.assertEqual(self.app.plan_exceptions.expire_due(self.clinic)["expired"], 0)
+        # 未经激活尝试、单纯到期的批准由巡检统一标记过期。
+        self.clock.set(datetime(2026, 9, 27, 12, 0, tzinfo=UTC))
+        second_assessment = self._assessment("second")
+        second_plan = self.app.create_plan(
+            self.clinic, self.doctor_a, self.patient["id"], "weight", self.doctor_a,
+            {"description": "第二个计划", "review_interval_days": 30}, {}, "2026-09-28",
+            target_date="2026-12-28", assessment_id=second_assessment, consent_id=self.consent["id"])
+        self.app.transition_plan(self.clinic, self.doctor_a, second_plan["id"], 1, "propose")
+        second = self.app.plan_exceptions.submit(
+            self.clinic, self.doctor_a, second_plan["id"],
+            deviation={"rule": "review_interval_days", "detail": "延长"}, clinical_reason="出差",
+            assessment_id=second_assessment, valid_until="2026-09-28T12:00:00Z", idempotency_key="exc-5b")
+        self.app.plan_exceptions.decide(self.clinic, self.doctor_b, second["id"], 1, "approve", note="短期")
+        self.clock.set(datetime(2026, 9, 29, 0, 0, tzinfo=UTC))
+        self.assertEqual(self.app.plan_exceptions.expire_due(self.clinic)["expired"], 1)
+
+    def test_return_resubmit_and_full_version_chain(self):
+        exception = self._submit(self.plan, "exc-6")
+        self.app.plan_exceptions.decide(self.clinic, self.doctor_b, exception["id"], 1, "return",
+                                        note="临床依据不足，请补充评估")
+        resent = self._submit(self.plan, "exc-6r", reason="已完成补充评估，依据更新",
+                              revision_note="按退回意见修订")
+        self.assertEqual(resent["revision"], 2)
+        chain = self.app.plan_exceptions.chain(self.clinic, self.owner, exception["id"])
+        self.assertEqual([(event["type"], event["revision"]) for event in chain["events"]],
+                         [("submitted", 1), ("returned", 1), ("resubmitted", 2)])
+        self.assertEqual([revision["revision"] for revision in chain["revisions"]], [1, 2])
+        self.assertEqual(chain["revisions"][0]["deviation"]["rule"], "review_interval_days")
+        self.assertTrue(chain["plan_revisions"])
+        self.assertEqual(chain["exception"]["state"], "pending")
+
+    def test_consent_withdrawal_invalidates_pending_exception(self):
+        exception = self._submit(self.plan, "exc-7")
+        self.app.withdraw_consent(self.clinic, self.doctor_a, self.consent["id"], "患者撤回授权")
+        self.assertEqual(self.app.plan_exceptions.get(self.clinic, self.doctor_b, exception["id"])["state"],
+                         "invalidated")
+
+    def test_withdrawn_exception_allows_routine_activation(self):
+        self.app.transition_plan(self.clinic, self.doctor_a, self.plan["id"], 1, "propose")
+        exception = self._submit(self.plan, "exc-8")
+        withdrawn = self.app.plan_exceptions.withdraw(self.clinic, self.doctor_a, exception["id"], 1,
+                                                      "决定按常规节奏执行")
+        self.assertEqual(withdrawn["state"], "withdrawn")
+        active = self.app.transition_plan(self.clinic, self.doctor_a, self.plan["id"], 2, "activate")
+        self.assertEqual(active["state"], "active")
+        self.assertIsNone(active["approved_exception_id"])
+
+    def test_exception_records_require_clinical_access(self):
+        self._submit(self.plan, "exc-9")
+        with self.assertRaises(Forbidden):
+            self.app.plan_exceptions.list_for_patient(self.clinic, self.coordinator, self.patient["id"])
+        items = self.app.plan_exceptions.list_for_patient(self.clinic, self.doctor_b, self.patient["id"])
+        self.assertEqual(len(items), 1)
+
+    def test_schedule_view_distinguishes_routine_and_exception_plans(self):
+        self.app.transition_plan(self.clinic, self.doctor_a, self.plan["id"], 1, "propose")
+        exception = self._submit(self.plan, "exc-10")
+        self.app.plan_exceptions.decide(self.clinic, self.doctor_b, exception["id"], 1, "approve", note="同意")
+        self.app.transition_plan(self.clinic, self.doctor_a, self.plan["id"], 2, "activate",
+                                 exception_id=exception["id"])
+        # 运营协调员无临床读权限，但可通过脱敏排程视图区分安排类型。
+        schedule = self.app.plan_exceptions.schedule_view(self.clinic, self.coordinator)
+        self.assertEqual(len(schedule), 1)
+        item = schedule[0]
+        self.assertEqual(item["arrangement"], "approved_exception")
+        self.assertEqual(item["exception_state"], "activated")
+        self.assertNotIn("clinical_reason", item)
+        self.assertNotIn("deviation", item)
+        # 撤回例外后的常规计划标记为 routine。
+        consent2 = self.app.grant_consent(self.clinic, self.doctor_a, self.patient["id"], "weight_program", 2,
+                                          hashlib.sha256(b"r2").hexdigest())
+        assessment2 = self._assessment("routine")
+        routine_plan = self.app.create_plan(
+            self.clinic, self.doctor_a, self.patient["id"], "weight", self.doctor_a,
+            {"description": "常规计划", "review_interval_days": 30}, {}, "2026-09-28",
+            target_date="2026-12-28", assessment_id=assessment2, consent_id=consent2["id"])
+        self.app.transition_plan(self.clinic, self.doctor_a, routine_plan["id"], 1, "propose")
+        self.app.transition_plan(self.clinic, self.doctor_a, routine_plan["id"], 2, "activate")
+        schedule = self.app.plan_exceptions.schedule_view(self.clinic, self.coordinator)
+        routine = next(item for item in schedule if item["plan_id"] == routine_plan["id"])
+        self.assertEqual(routine["arrangement"], "routine")
+
+    def test_exception_flow_works_over_http_with_idempotency_header(self):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), create_handler(self.app))
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_port}"
+
+        def call(method: str, path: str, token: str, payload: dict | None = None, key: str | None = None):
+            headers = {"X-Clinic-ID": self.clinic, "Authorization": f"Bearer {token}",
+                       "Content-Type": "application/json"}
+            if key:
+                headers["Idempotency-Key"] = key
+            request = Request(base + path, data=json.dumps(payload).encode() if payload is not None else None,
+                              method=method, headers=headers)
+            with urlopen(request, timeout=3) as response:
+                return response.status, json.loads(response.read())
+
+        try:
+            # 测试环境通过负责人为两位医生设置密码后登录。
+            self.app.set_password(self.clinic, self.owner, self.doctor_a, "DoctorPass!2026")
+            self.app.set_password(self.clinic, self.owner, self.doctor_b, "DoctorPass!2026")
+            token_a = self.app.login(self.clinic, self.doctor_a, "DoctorPass!2026")["access_token"]
+            token_b = self.app.login(self.clinic, self.doctor_b, "DoctorPass!2026")["access_token"]
+            status, exception = call(
+                "POST", f"/plans/{self.plan['id']}/exceptions", token_a,
+                {"deviation": {"rule": "review_interval_days", "detail": "延长至 45 天"},
+                 "clinical_reason": "患者出差", "assessment_id": self.assessment,
+                 "valid_until": "2026-11-27T12:00:00Z"}, key="http-exc-1")
+            self.assertEqual(status, 201)
+            status, replay = call(
+                "POST", f"/plans/{self.plan['id']}/exceptions", token_a,
+                {"deviation": {"rule": "review_interval_days", "detail": "延长至 45 天"},
+                 "clinical_reason": "患者出差", "assessment_id": self.assessment,
+                 "valid_until": "2026-11-27T12:00:00Z"}, key="http-exc-1")
+            self.assertEqual(replay["id"], exception["id"])
+            self.assertTrue(replay["replayed"])
+            status, approved = call(
+                "POST", f"/plan-exceptions/{exception['id']}/approve", token_b,
+                {"expected_version": 1, "note": "同意"})
+            self.assertEqual(status, 200)
+            self.assertEqual(approved["state"], "approved")
+            status, chain = call("GET", f"/plan-exceptions/{exception['id']}/chain", token_b)
+            self.assertEqual([event["type"] for event in chain["events"]], ["submitted", "approved"])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=3)
+
+
 if __name__ == "__main__":
     unittest.main()

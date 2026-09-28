@@ -149,13 +149,49 @@ def create_handler(app: Careflow):
             if len(segments) == 3 and segments[0] == "plans" and segments[2] in {"propose", "activate", "pause", "resume", "complete", "cancel"} and self.command == "POST":
                 data = self.body()
                 return app.transition_plan(clinic_id, actor_id, segments[1], data.get("expected_version", 0),
-                                           segments[2], reason=data.get("reason")), 200
+                                           segments[2], reason=data.get("reason"),
+                                           exception_id=data.get("exception_id")), 200
+            if len(segments) == 3 and segments[0] == "plans" and segments[2] == "revise" and self.command == "POST":
+                data = self.body()
+                return app.revise_plan(clinic_id, actor_id, segments[1], data.get("expected_version", 0),
+                                       reason=data.get("reason", ""), goal=data.get("goal"), risk=data.get("risk"),
+                                       target_date=data.get("target_date"),
+                                       assessment_id=data.get("assessment_id")), 200
+            if len(segments) == 3 and segments[0] == "plans" and segments[2] == "exceptions" and self.command == "POST":
+                data = self.body()
+                return app.plan_exceptions.submit(clinic_id, actor_id, segments[1],
+                                                  deviation=data.get("deviation", {}),
+                                                  clinical_reason=data.get("clinical_reason", ""),
+                                                  assessment_id=data.get("assessment_id"),
+                                                  valid_until=data.get("valid_until", ""),
+                                                  idempotency_key=self.headers.get("Idempotency-Key", ""),
+                                                  revision_note=data.get("revision_note")), 201
+            if self.command == "POST" and len(segments) == 3 and segments[0] == "plan-exceptions" and segments[2] in {"approve", "return"}:
+                data = self.body()
+                return app.plan_exceptions.decide(clinic_id, actor_id, segments[1],
+                                                  data.get("expected_version", 0), segments[2],
+                                                  note=data.get("note", "")), 200
+            if self.command == "POST" and len(segments) == 3 and segments[0] == "plan-exceptions" and segments[2] == "withdraw":
+                data = self.body()
+                return app.plan_exceptions.withdraw(clinic_id, actor_id, segments[1],
+                                                    data.get("expected_version", 0), data.get("reason", "")), 200
+            if self.command == "POST" and segments == ["plan-exceptions", "expire-due"]:
+                data = self.body()
+                return app.plan_exceptions.expire_due(clinic_id, limit=data.get("limit", 200)), 200
+            if self.command == "GET" and len(segments) == 3 and segments[0] == "plan-exceptions" and segments[2] == "chain":
+                return app.plan_exceptions.chain(clinic_id, actor_id, segments[1]), 200
+            if self.command == "GET" and len(segments) == 2 and segments[0] == "plan-exceptions":
+                return app.plan_exceptions.get(clinic_id, actor_id, segments[1]), 200
+            if self.command == "GET" and len(segments) == 3 and segments[0] == "patients" and segments[2] == "plan-exceptions":
+                return {"items": app.plan_exceptions.list_for_patient(clinic_id, actor_id, segments[1])}, 200
             if len(segments) == 3 and segments[0] == "plans" and segments[2] == "milestones" and self.command == "POST":
                 data = self.body()
                 return app.milestones.create(clinic_id, actor_id, segments[1], data.get("kind", ""),
                                              data.get("title", ""), data.get("due_at", ""),
                                              self.headers.get("Idempotency-Key", ""),
                                              assigned_to=data.get("assigned_to")), 201
+            if self.command == "GET" and segments == ["plans", "exception-schedule"]:
+                return {"items": app.plan_exceptions.schedule_view(clinic_id, actor_id)}, 200
             if len(segments) == 2 and segments[0] == "plans" and self.command == "GET":
                 return {"items": app.milestones.list_for_plan(clinic_id, actor_id, segments[1])}, 200
             if len(segments) == 3 and segments[0] == "milestones" and segments[2] in {"complete", "defer", "waive", "cancel"} and self.command == "POST":

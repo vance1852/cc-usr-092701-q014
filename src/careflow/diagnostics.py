@@ -49,6 +49,7 @@ class ConsistencyChecker:
         self.check_followup_leases()
         self.check_incident_ledger()
         self.check_signed_records()
+        self.check_plan_exception_bindings()
         self.check_duplicate_active_reservations()
         chain = audit.verify_chain(self.connection, self.clinic_id)
         if not chain["ok"]:
@@ -204,6 +205,38 @@ class ConsistencyChecker:
             self.add("encounter.signature_mismatch", "high", "encounter", row["id"],
                      {"patient_id": row["patient_id"], "state": row["state"], "signed_by": row["signed_by"],
                       "signed_at": row["signed_at"], "version": row["version"]}, "保留就诊原文并由临床负责人复核签署凭据。")
+
+    def check_plan_exception_bindings(self) -> None:
+        rows = self.connection.execute(
+            "SELECT e.id,e.plan_id,e.state AS exception_state,e.current_revision,e.approved_revision,"
+            "e.approved_plan_digest,e.valid_until,p.state AS plan_state,p.version AS plan_version,"
+            "p.approved_exception_id,p.patient_id,p.kind,p.goal_json,p.risk_json,p.clinical_owner,"
+            "p.assessment_id,p.consent_id,p.start_date,p.target_date "
+            "FROM plan_exceptions e JOIN plans p ON p.id=e.plan_id WHERE p.clinic_id=? ORDER BY e.id",
+            (self.clinic_id,)).fetchall()
+        from .exceptions import plan_fingerprint
+
+        for row in rows:
+            if row["exception_state"] == "pending" and row["plan_state"] == "active":
+                self.add("plan_exception.pending_on_active", "high", "plan_exception", row["id"],
+                         {"plan_id": row["plan_id"], "plan_state": row["plan_state"]},
+                         "计划已生效但例外仍在审批中；核对生效依据并暂停按例外执行的安排。")
+            if row["exception_state"] == "approved" and row["plan_state"] == "active":
+                self.add("plan_exception.approved_not_consumed", "high", "plan_exception", row["id"],
+                         {"plan_id": row["plan_id"], "valid_until": row["valid_until"]},
+                         "计划生效时未消费已批准的例外；补登记生效依据或重新送审。")
+            if row["exception_state"] == "approved" and row["approved_plan_digest"] != plan_fingerprint(row):
+                self.add("plan_exception.digest_drift", "critical", "plan_exception", row["id"],
+                         {"plan_id": row["plan_id"], "approved_revision": row["approved_revision"],
+                          "plan_version": row["plan_version"]},
+                         "计划内容自批准后已变化但审批未失效；立即暂停该例外的使用并重新送审。")
+            if row["approved_exception_id"] and row["approved_exception_id"] != row["id"]:
+                continue
+            if row["plan_state"] == "active" and row["approved_exception_id"] == row["id"] \
+                    and row["exception_state"] != "activated":
+                self.add("plan_exception.binding_state_mismatch", "critical", "plan_exception", row["id"],
+                         {"plan_id": row["plan_id"], "exception_state": row["exception_state"]},
+                         "计划登记的例外未处于已生效状态；核对版本链后再继续履约。")
 
     def check_duplicate_active_reservations(self) -> None:
         rows = self.connection.execute(
