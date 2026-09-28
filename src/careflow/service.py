@@ -37,11 +37,13 @@ class Careflow:
         from .exports import PatientExportService
         from .milestones import MilestoneService
         from .clinical_flags import ClinicalFlagService
+        from .exceptions import PlanExceptionService, plan_content_digest
         self.supplies = SupplyService(self.db, self.clock)
         self.reports = ReportService(self.db, self.clock)
         self.exports = PatientExportService(self.db, self.clock)
         self.milestones = MilestoneService(self.db, self.clock)
         self.clinical_flags = ClinicalFlagService(self.db, self.clock)
+        self.plan_exceptions = PlanExceptionService(self.db, self.clock)
 
     def now(self) -> str:
         return timestamp(self.clock.now())
@@ -481,6 +483,92 @@ class Careflow:
         connection.execute("INSERT INTO plan_revisions(plan_id,revision,snapshot_json,changed_by,change_reason,created_at) VALUES(?,?,?,?,?,?)",
                            (plan_id, revision, encode_json(snapshot), actor_id, reason, now))
 
+    def revise_plan(self, clinic_id: str, actor_id: str, plan_id: str, expected_version: int, *,
+                    reason: str, goal: dict | None = None, risk: dict | None = None,
+                    start_date: str | None = None, target_date: object = None,
+                    clinical_owner: str | None = None, assessment_id: object = None,
+                    consent_id: object = None) -> dict[str, Any]:
+        """修订计划内容（不含状态转换）。任何内容变化都会使针对旧版本的例外审批失效。"""
+        from .exceptions import plan_content_digest
+
+        reason = text(reason, "修订原因", maximum=600)
+        updates: dict[str, Any] = {}
+        if goal is not None:
+            goal = object_value(goal, "目标", allowed={"description", "measure", "target", "review_interval_days"})
+            if "description" not in goal:
+                raise ValidationError("目标需要包含说明")
+            goal["description"] = text(goal["description"], "目标说明", maximum=1000)
+            if "review_interval_days" in goal:
+                goal["review_interval_days"] = int(decimal_value(goal["review_interval_days"], "复核间隔", minimum="1", maximum="365"))
+            updates["goal_json"] = encode_json(goal)
+        if risk is not None:
+            updates["risk_json"] = encode_json(
+                object_value(risk, "风险摘要", allowed={"screening", "contraindications", "review_required", "notes"}))
+        if start_date is not None:
+            updates["start_date"] = calendar_date(start_date, "开始日期")
+        if target_date is not None:
+            updates["target_date"] = calendar_date(target_date, "目标日期") if target_date else None
+        if clinical_owner is not None:
+            updates["clinical_owner"] = clinical_owner
+        if assessment_id is not None:
+            updates["assessment_id"] = assessment_id or None
+        if consent_id is not None:
+            updates["consent_id"] = consent_id or None
+        if not updates:
+            raise ValidationError("未提供任何计划修订内容")
+        now = self.now()
+        with self.db.transaction() as connection:
+            principal = principal_for(connection, actor_id, clinic_id)
+            authorize(principal, "clinical:write", clinic_id=clinic_id)
+            if principal.role not in {"clinician", "owner"}:
+                raise Forbidden("只有医生或诊所负责人可以修订计划内容")
+            plan = connection.execute("SELECT * FROM plans WHERE id=? AND clinic_id=?", (plan_id, clinic_id)).fetchone()
+            if plan is None:
+                raise NotFound("诊疗计划不存在")
+            require_match(plan["version"], expected_version, "诊疗计划")
+            if plan["state"] not in {"draft", "proposed", "paused"}:
+                raise Conflict("当前计划状态不能直接修订内容", details={"state": plan["state"]})
+            start = updates.get("start_date", plan["start_date"])
+            target = updates["target_date"] if "target_date" in updates else plan["target_date"]
+            if target and target < start:
+                raise ValidationError("目标日期不能早于开始日期")
+            if "clinical_owner" in updates:
+                owner = connection.execute("SELECT * FROM staff WHERE id=? AND clinic_id=? AND active=1",
+                                           (updates["clinical_owner"], clinic_id)).fetchone()
+                if owner is None or owner["role"] not in {"clinician", "owner"}:
+                    raise ValidationError("临床负责人必须是有效的医生或负责人")
+            if "assessment_id" in updates and updates["assessment_id"]:
+                assessment = connection.execute("SELECT * FROM assessments WHERE id=? AND patient_id=?",
+                                                (updates["assessment_id"], plan["patient_id"])).fetchone()
+                if assessment is None or assessment["status"] != "signed":
+                    raise Conflict("计划引用的评估不存在或尚未签署")
+            new_consent = updates["consent_id"] if "consent_id" in updates else plan["consent_id"]
+            required_purpose = {"aesthetic": "aesthetic_procedure", "weight": "weight_program"}.get(plan["kind"])
+            if required_purpose and not new_consent:
+                raise Conflict("医美和体重管理计划必须保留当前有效授权")
+            if required_purpose and new_consent:
+                consent = connection.execute(
+                    "SELECT * FROM consents WHERE id=? AND patient_id=? AND purpose=? AND state='granted'",
+                    (new_consent, plan["patient_id"], required_purpose)).fetchone()
+                if consent is None or (consent["expires_at"] and parsed_timestamp(consent["expires_at"]) <= parsed_timestamp(now)):
+                    raise Conflict("计划需要当前有效的对应授权")
+            old_digest = plan_content_digest(plan)
+            assignments = ", ".join(f"{column}=?" for column in updates)
+            values = [*updates.values()]
+            connection.execute(f"UPDATE plans SET {assignments}, updated_at=?, version=version+1 WHERE id=?",
+                               (*values, now, plan_id))
+            current = connection.execute("SELECT * FROM plans WHERE id=?", (plan_id,)).fetchone()
+            new_version = current["version"]
+            self._record_plan_revision(connection, plan_id, new_version, actor_id, reason, now)
+            voided = self.plan_exceptions.void_for_content_change(
+                connection, current, old_digest, plan_content_digest(current), actor_id, now)
+            audit.append_event(connection, clinic_id=clinic_id, actor_id=actor_id, patient_id=plan["patient_id"],
+                               aggregate_type="plan", aggregate_id=plan_id, action="plan.revised", occurred_at=now,
+                               payload={"fields": sorted(updates), "reason": reason, "version": new_version,
+                                        "voided_exceptions": voided})
+            return {"id": plan_id, "state": current["state"], "version": new_version, "updated_at": now,
+                    "voided_exceptions": voided}
+
     def transition_plan(self, clinic_id: str, actor_id: str, plan_id: str, expected_version: int,
                         action: str, *, reason: str | None = None) -> dict[str, Any]:
         transitions = {"propose": ("draft", "proposed"), "activate": ("proposed", "active"),
@@ -498,6 +586,7 @@ class Careflow:
             if plan is None:
                 raise NotFound("诊疗计划不存在")
             require_match(plan["version"], expected_version, "诊疗计划")
+            exception = None
             before, after = transitions[action]
             if plan["state"] not in ((before,) if isinstance(before, str) else before):
                 raise Conflict("诊疗计划当前状态不允许此操作", details={"state": plan["state"], "action": action})
@@ -505,12 +594,19 @@ class Careflow:
                 consent = connection.execute("SELECT state,expires_at FROM consents WHERE id=?", (plan["consent_id"],)).fetchone()
                 if consent is None or consent["state"] != "granted" or (consent["expires_at"] and parsed_timestamp(consent["expires_at"]) <= parsed_timestamp(now)):
                     raise Conflict("计划授权已撤回或过期")
+            if action in {"activate", "resume"}:
+                # 常规计划无任何例外记录；一旦该计划存在例外历史，生效必须持有针对当前内容、
+                # 尚未过期且已同意的审批，迟到的激活请求不能复用过期或旧版本审批。
+                exception = self.plan_exceptions.require_usable_approval(connection, plan, now)
             new_version = plan["version"] + 1
             connection.execute("UPDATE plans SET state=?,updated_at=?,version=? WHERE id=?", (after, now, new_version, plan_id))
             self._record_plan_revision(connection, plan_id, new_version, actor_id, reason or action, now)
             audit.append_event(connection, clinic_id=clinic_id, actor_id=actor_id, patient_id=plan["patient_id"],
                                aggregate_type="plan", aggregate_id=plan_id, action=f"plan.{action}", occurred_at=now,
-                               payload={"from": plan["state"], "to": after, "reason": reason, "version": new_version})
+                               payload={"from": plan["state"], "to": after, "reason": reason, "version": new_version,
+                                        "exception_id": exception["id"] if exception else None})
+            if exception:
+                self.plan_exceptions.mark_effectuated(connection, exception, plan, actor_id, now, new_version)
         return {"id": plan_id, "state": after, "version": new_version, "updated_at": now}
 
     def plan_history(self, clinic_id: str, actor_id: str, plan_id: str) -> list[dict[str, Any]]:

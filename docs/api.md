@@ -17,9 +17,20 @@
 - `POST /patients/{patient_id}/consents` 创建更高版本的授权；`POST /consents/{consent_id}/withdraw` 撤回授权。
 - `POST /patients/{patient_id}/plans` 建立计划，医美和体重管理计划必须引用当前对应授权。
 - `POST /plans/{plan_id}/{propose|activate|pause|resume|complete|cancel}` 以 `expected_version` 执行带版本保护的状态转换。
+- `POST /plans/{plan_id}/revise` 修订计划内容（目标、风险、日期、负责人、评估或授权），不改变计划状态；修订产生新版本。
 - `GET /patients/{patient_id}/weight-series` 返回按观察时间排序的测量值，不生成诊断或治疗建议。
 
 评估签署后不可覆盖。就诊病历由章节组成，签署需要主诉、评估和计划三部分；签署后的补充内容成为新版本，原始文字仍保留。
+
+## 特殊计划例外审批
+
+超出诊所常规疗程节奏的计划不能由主治医生自行放行，须走固定版本的双人审批：
+
+- `POST /plans/{plan_id}/exceptions` 提交申请（需要 `Idempotency-Key`），内容包括偏离的规则 `rule`、`clinical_reason`、已签署的 `assessment_id` 和 `valid_until`。申请固定在提交时的计划版本与内容摘要（`plan_version`、`plan_digest`）上。
+- `POST /plan-exceptions/{exception_id}/{approve|return}` 由另一位具备资质的医生（clinician/owner）决定；退回必须填写 `note`，并以 `expected_version` 保护。
+- `GET /plan-exceptions/{exception_id}` 查看申请与逐事件台账；`GET /plan-exceptions/pending` 是待审批队列；`GET /plans/{plan_id}/exception-chain` 返回计划修订、全部申请与审批、最终生效的完整版本链。
+
+审批人不得是申请人本人。存在未复核的停止级安全关注项、关联授权撤回或过期、申请超过有效期时不得批准；送审后计划内容若已变化也不能批准。审批后计划内容再次修订，待审批与已同意的申请自动失效（`voided`），必须重新送审。计划激活（含暂停后恢复）时重新核对内容摘要与有效期：没有任何例外记录的常规计划按常规路径生效；存在例外历史时，必须持有针对当前内容且未过期的"已同意"审批，过期审批不能被迟到的激活请求使用。同一 `Idempotency-Key` 重复提交返回原申请及其最新状态；键相同但内容不同返回冲突。
 
 ## 预约、随访与计划节点
 
@@ -46,6 +57,7 @@
 ## 主要状态
 
 - 计划：草稿 → 提议 → 生效；可暂停和恢复，完成或取消后不能重新激活。
+- 计划例外：待审批 → 已同意或已退回；计划内容变化使申请/审批作废，作废后须重新送审。
 - 预约：占位 → 确认 → 到诊 → 服务中 → 完成；取消和未到诊是独立终态。
 - 不良事件：已报告 → 分诊 → 观察 → 已解决 → 关闭。每次处置单独记录操作人和理由。
 - 耗材预留：预留 → 释放或核销。库存数量由收货、预留、释放和更正流水求和，不直接改写历史数量。

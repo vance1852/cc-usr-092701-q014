@@ -150,6 +150,35 @@ def create_handler(app: Careflow):
                 data = self.body()
                 return app.transition_plan(clinic_id, actor_id, segments[1], data.get("expected_version", 0),
                                            segments[2], reason=data.get("reason")), 200
+            if len(segments) == 3 and segments[0] == "plans" and segments[2] == "revise" and self.command == "POST":
+                data = self.body()
+                return app.revise_plan(clinic_id, actor_id, segments[1], data.get("expected_version", 0),
+                                       reason=data.get("reason", ""), goal=data.get("goal"), risk=data.get("risk"),
+                                       start_date=data.get("start_date"), target_date=data.get("target_date"),
+                                       clinical_owner=data.get("clinical_owner"),
+                                       assessment_id=data.get("assessment_id"),
+                                       consent_id=data.get("consent_id")), 200
+            if len(segments) == 3 and segments[0] == "plans" and segments[2] == "exceptions" and self.command == "POST":
+                data = self.body()
+                return app.plan_exceptions.submit(clinic_id, actor_id, segments[1],
+                                                  rule=data.get("rule", ""),
+                                                  clinical_reason=data.get("clinical_reason", ""),
+                                                  assessment_id=data.get("assessment_id", ""),
+                                                  valid_until=data.get("valid_until", ""),
+                                                  idempotency_key=self.headers.get("Idempotency-Key", "")), 201
+            if len(segments) == 3 and segments[0] == "plans" and segments[2] == "exception-chain" and self.command == "GET":
+                return app.plan_exceptions.chain_for_plan(clinic_id, actor_id, segments[1]), 200
+            if self.command == "GET" and segments == ["plan-exceptions", "pending"]:
+                params = parse_qs(path.query)
+                return app.plan_exceptions.pending_queue(clinic_id, actor_id,
+                                                         limit=int(params.get("limit", [100])[0])), 200
+            if len(segments) == 3 and segments[0] == "plan-exceptions" and segments[2] in {"approve", "return"} and self.command == "POST":
+                data = self.body()
+                return app.plan_exceptions.decide(clinic_id, actor_id, segments[1], segments[2],
+                                                  data.get("note", ""),
+                                                  expected_version=data.get("expected_version", 0)), 200
+            if len(segments) == 2 and segments[0] == "plan-exceptions" and self.command == "GET":
+                return app.plan_exceptions.get(clinic_id, actor_id, segments[1]), 200
             if len(segments) == 3 and segments[0] == "plans" and segments[2] == "milestones" and self.command == "POST":
                 data = self.body()
                 return app.milestones.create(clinic_id, actor_id, segments[1], data.get("kind", ""),

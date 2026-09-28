@@ -155,6 +155,43 @@ CREATE TABLE IF NOT EXISTS plan_revisions (
     created_at TEXT NOT NULL,
     PRIMARY KEY(plan_id,revision)
 );
+CREATE TABLE IF NOT EXISTS plan_exceptions (
+    id TEXT PRIMARY KEY,
+    plan_id TEXT NOT NULL REFERENCES plans(id),
+    clinic_id TEXT NOT NULL REFERENCES clinics(id),
+    patient_id TEXT NOT NULL REFERENCES patients(id),
+    status TEXT NOT NULL CHECK(status IN ('pending','approved','returned','voided')),
+    applicant_id TEXT NOT NULL REFERENCES staff(id),
+    reviewer_id TEXT REFERENCES staff(id),
+    plan_version INTEGER NOT NULL,
+    plan_digest TEXT NOT NULL,
+    rule TEXT NOT NULL,
+    clinical_reason TEXT NOT NULL,
+    assessment_id TEXT NOT NULL REFERENCES assessments(id),
+    valid_until TEXT NOT NULL,
+    requested_at TEXT NOT NULL,
+    decided_at TEXT,
+    decision_note TEXT,
+    voided_at TEXT,
+    void_reason TEXT,
+    effectuated_at TEXT,
+    idempotency_key TEXT NOT NULL,
+    version INTEGER NOT NULL DEFAULT 1,
+    UNIQUE(clinic_id,idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS plan_exceptions_plan ON plan_exceptions(plan_id,requested_at);
+CREATE INDEX IF NOT EXISTS plan_exceptions_status ON plan_exceptions(clinic_id,status,requested_at);
+CREATE TABLE IF NOT EXISTS plan_exception_events (
+    id TEXT PRIMARY KEY,
+    exception_id TEXT NOT NULL REFERENCES plan_exceptions(id),
+    sequence INTEGER NOT NULL,
+    event_type TEXT NOT NULL CHECK(event_type IN ('submitted','approved','returned','voided','effectuated')),
+    actor_id TEXT NOT NULL REFERENCES staff(id),
+    note TEXT,
+    plan_version INTEGER NOT NULL,
+    occurred_at TEXT NOT NULL,
+    UNIQUE(exception_id,sequence)
+);
 CREATE TABLE IF NOT EXISTS appointments (
     id TEXT PRIMARY KEY,
     clinic_id TEXT NOT NULL REFERENCES clinics(id),
